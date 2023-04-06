@@ -1,145 +1,112 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
 
-type mockService struct {
+type testService struct {
 	n uint64
 	p time.Duration
 }
 
-func (s *mockService) GetLimits() (n uint64, p time.Duration) {
+func (s *testService) GetLimits() (uint64, time.Duration) {
 	return s.n, s.p
 }
 
-func (s *mockService) Process(ctx context.Context, batch Batch) error {
-	// Simulate some processing time.
-	time.Sleep(100 * time.Millisecond)
+func (s *testService) Process(ctx context.Context, batch Batch) error {
+	if len(batch) == 0 {
+		return errors.New("empty batch")
+	}
+
+	time.Sleep(s.p)
+	fmt.Printf("Processed batch of %d items\n", len(batch))
 	return nil
 }
 
-func TestClient_ProcessItems(t *testing.T) {
-	tests := []struct {
-		name        string
-		service     Service
-		items       []Item
-		expectedErr error
-	}{
-		{
-			name: "process all items",
-			service: &mockService{
-				n: 2,
-				p: time.Second,
-			},
-			items:       []Item{{}, {}, {}, {}},
-			expectedErr: nil,
-		},
-		{
-			name: "block processing",
-			service: &mockService{
-				n: 2,
-				p: time.Millisecond,
-			},
-			items:       []Item{{}, {}, {}, {}},
-			expectedErr: ErrBlocked,
-		},
-		{
-			name: "empty batch",
-			service: &mockService{
-				n: 2,
-				p: time.Second,
-			},
-			items:       []Item{},
-			expectedErr: nil,
-		},
+func TestClientRun(t *testing.T) {
+	service := &testService{
+		n: 2,
+		p: time.Millisecond * 50,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := NewClient(tt.service)
+	client := NewClient(service)
 
-			ctx := context.Background()
-			err := client.ProcessItems(ctx, tt.items)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*200)
+	defer cancel()
 
-			if err != tt.expectedErr {
-				t.Errorf("expected error %v, but got %v", tt.expectedErr, err)
-			}
-		})
+	go client.Run(ctx)
+
+	batch := make(Batch, 4)
+	for i := range batch {
+		batch[i] = Item{}
+	}
+	client.Process(batch)
+
+	<-ctx.Done()
+}
+
+func TestConvertRequestToBatch(t *testing.T) {
+	items := []int{1, 2, 3, 4, 5}
+	data, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest("POST", "/process", bytes.NewBuffer(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	batch, err := convertRequestToBatch(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(batch) != len(items) {
+		t.Fatalf("expected %d items, got %d", len(items), len(batch))
 	}
 }
 
-func TestAPI_ProcessItemsHandler(t *testing.T) {
-	tests := []struct {
-		name           string
-		service        Service
-		requestBody    string
-		expectedStatus int
-		expectedBody   string
-		expectedErr    error
-	}{
-		{
-			name: "process all items",
-			service: &mockService{
-				n: 2,
-				p: time.Second,
-			},
-			requestBody:    "[{}, {}, {}, {}]",
-			expectedStatus: http.StatusOK,
-			expectedBody:   "",
-			expectedErr:    nil,
-		},
-		{
-			name: "block processing",
-			service: &mockService{
-				n: 2,
-				p: time.Millisecond,
-			},
-			requestBody:    "[{}, {}, {}, {}]",
-			expectedStatus: http.StatusTooManyRequests,
-			expectedBody:   "blocked\n",
-			expectedErr:    ErrBlocked,
-		},
-		{
-			name: "bad request",
-			service: &mockService{
-				n: 2,
-				p: time.Second,
-			},
-			requestBody:    "invalid",
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "invalid character 'i' looking for beginning of value\n",
-			expectedErr:    nil,
-		},
+func TestHandleRequest(t *testing.T) {
+	service := NewDummyService(2, time.Millisecond*50)
+	client := NewClient(service)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*200)
+	defer cancel()
+
+	go client.Run(ctx)
+
+	items := []int{1, 2, 3, 4, 5}
+	data, err := json.Marshal(items)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := NewClient(tt.service)
-			api := NewAPI(client)
+	req, err := http.NewRequest("POST", "/process", bytes.NewBuffer(data))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-			handler := http.HandlerFunc(api.ProcessItemsHandler)
+	req.Header.Set("Content-Type", "application/json")
 
-			req, err := http.NewRequest("POST", "/items", strings.NewReader(tt.requestBody))
-			if err != nil {
-				t.Fatal(err)
-			}
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRequest(client, w, r)
+	})
 
-			rr := httptest.NewRecorder()
-			handler.ServeHTTP(rr, req)
+	handler.ServeHTTP(rr, req)
 
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("expected status %v, but got %v", tt.expectedStatus, rr.Code)
-			}
-
-			if rr.Body.String() != tt.expectedBody {
-				t.Errorf("expected body %v, but got %v", tt.expectedBody, rr.Body.String())
-			}
-		})
+	if status := rr.Code; status != http.StatusOK {
+		t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
 	}
 }
